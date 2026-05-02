@@ -90,17 +90,28 @@ chmod +x xwiki2obsidian.sh
 
 ## Output structure
 
+**Default** (per-note subfolders):
 ```
 obsidian-vault/
 ├── Crypto/
 │   ├── Tron settings.md
-│   └── Tron settings/
+│   └── Tron settings/        ← attachments for this note
 │       ├── image1.png
 │       └── file.rsc
-├── Development/
-│   └── ...
 └── ...
 ```
+
+**With `--flat-attachments`** (single shared folder):
+```
+obsidian-vault/
+├── _attachments/             ← all images and files from all notes
+│   ├── image1.png
+│   └── file.rsc
+├── Crypto/
+│   └── Tron settings.md
+└── ...
+```
+With `--flat-attachments`, set **Obsidian → Settings → Files & Links → Default location for new attachments** to `_attachments` so new files follow the same convention.
 
 ---
 

@@ -14,14 +14,30 @@
 # Dependencies: pandoc, python3, python3-bs4
 #
 # Usage:
-#   ./xwiki2obsidian.sh [pages_dir] [attachments_dir] [output_dir]
+#   ./xwiki2obsidian.sh [pages_dir] [attachments_dir] [output_dir] [--flat-attachments]
+#
+# Options:
+#   --flat-attachments   Copy all attachments into a single _attachments/ folder
+#                        instead of per-note subfolders. Keeps the Obsidian file
+#                        tree clean. Default: off (per-note subfolders).
 # =============================================================================
 
 set -euo pipefail
 
-PAGES_DIR="${1:-$HOME/xwiki-export/pages/xwiki/Main}"
-ATTACHMENTS_DIR="${2:-$HOME/xwiki-export/attachment/xwiki/Main}"
-OUTPUT_DIR="${3:-$HOME/obsidian-vault}"
+FLAT_ATTACHMENTS=false
+POSITIONAL=()
+
+# Separate flags from positional arguments
+for arg in "$@"; do
+    case "$arg" in
+        --flat-attachments) FLAT_ATTACHMENTS=true ;;
+        *) POSITIONAL+=("$arg") ;;
+    esac
+done
+
+PAGES_DIR="${POSITIONAL[0]:-$HOME/xwiki-export/pages/xwiki/Main}"
+ATTACHMENTS_DIR="${POSITIONAL[1]:-$HOME/xwiki-export/attachment/xwiki/Main}"
+OUTPUT_DIR="${POSITIONAL[2]:-$HOME/obsidian-vault}"
 
 # --- Dependency check ---
 MISSING=0
@@ -45,6 +61,7 @@ error() { echo -e "${RED}[ERR]${NC} $1"; }
 
 COUNT_OK=0
 COUNT_ERR=0
+COUNT_SKIP=0
 
 # Python helper — extracts div#xwikicontent and cleans XWiki-specific HTML noise
 EXTRACTOR=$(cat <<'PYEOF'
@@ -116,9 +133,21 @@ for li in content.find_all('li'):
     for div in li.find_all('div'):
         div.unwrap()
 
+# Convert successmessage/infomessage/warningmessage boxes to blockquotes
+for div in content.find_all('div', class_=lambda c: c and any(
+        x in c for x in ['successmessage', 'infomessage', 'warningmessage', 'errormessage'])):
+    bq = soup.new_tag('blockquote')
+    bq.extend(div.contents[:])
+    div.replace_with(bq)
+
 # Remove empty wikimodel divs
 for div in content.find_all('div', class_='wikimodel-emptyline'):
     div.decompose()
+
+# Unwrap all remaining <div> tags — keeps content, removes wrapper
+# Must be done last so special divs (box, successmessage) are handled first
+for div in content.find_all('div'):
+    div.unwrap()
 
 print(content.decode_contents())
 PYEOF
@@ -135,6 +164,8 @@ import sys, re, os
 from bs4 import BeautifulSoup
 
 note_name = sys.argv[1]
+flat = len(sys.argv) > 2 and sys.argv[2] == "true"
+attach_prefix = "_attachments" if flat else note_name
 text = sys.stdin.read()
 
 # Detect if a path points to a local XWiki attachment
@@ -151,7 +182,7 @@ def replace_md_img(m):
     alt, path = m.group(1), m.group(2)
     if is_local_attachment(path):
         fname = os.path.basename(path)
-        return f'![[{note_name}/{fname}]]'
+        return f'![[_attachments/{fname}]]'
     return m.group(0)  # external image — leave as-is
 
 result = re.sub(r'!\[([^\]]*)\]\(([^)]+)\)', replace_md_img, text)
@@ -162,7 +193,7 @@ def replace_md_link(m):
     label, path = m.group(1), m.group(2)
     if is_local_attachment(path):
         fname = os.path.basename(path)
-        return f'[[{note_name}/{fname}|{label}]]'
+        return f'[[{attach_prefix}/{fname}|{label}]]'
     return m.group(0)  # external link — leave as-is
 
 result = re.sub(r'(?<!!)\[([^\]]+)\]\(([^)]+)\)', replace_md_link, result)
@@ -175,7 +206,7 @@ def replace_raw_img(m):
         return m.group(0)
     src = img.get('src', '')
     fname = os.path.basename(src)
-    return f'![[{note_name}/{fname}]]'
+    return f'![[{attach_prefix}/{fname}]]'
 
 result = re.sub(r'<img\s[^>]*/?>',  replace_raw_img, result, flags=re.DOTALL | re.IGNORECASE)
 
@@ -200,6 +231,10 @@ result = re.sub(r'(?:^    .+\n?)+', indent_to_fence, result, flags=re.MULTILINE)
 
 # Remove any remaining empty divs
 result = re.sub(r'<div[^>]*>\s*</div>', '', result)
+
+# Remove attachment links pointing to WebHome.html (XWiki self-referencing export artifact)
+result = re.sub(r'\[\[[^\]]*WebHome\.html\|([^\]]*)\]\]', r'\1', result)
+result = re.sub(r'\[\[[^\]]*WebHome\.html\]\]', '', result)
 
 # Unescape characters pandoc unnecessarily escapes in GFM output:
 #   \` → `   (backticks inside code)
@@ -232,17 +267,52 @@ echo "========================================================"
 while IFS= read -r -d '' html_file; do
 
     note_dir=$(dirname "$html_file")
-    note_encoded=$(basename "$note_dir")
-    category_dir=$(dirname "$note_dir")
-    category=$(basename "$category_dir")
 
-    # Decode URL-encoded note name (+ → space, %XX → char)
-    note_name=$(printf '%b' "${note_encoded//+/ }" | \
-        python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
+    # Skip WebHome.html files that sit directly inside PAGES_DIR or one level deep
+    # (e.g. Main/WebHome.html or Main/Crypto/WebHome.html) — these are XWiki category
+    # index pages auto-generated with a child page list, not real notes.
+    rel_depth=$(echo "${note_dir#$PAGES_DIR/}" | tr -cd '/' | wc -c)
+    if [ "$rel_depth" -lt 1 ]; then
+        continue
+    fi
 
-    out_category_dir="$OUTPUT_DIR/$category"
+    # Skip XWiki auto-generated category index pages — they contain a child page
+    # list macro and no real content. Identified by the pagination widget text.
+    content_text=$(python3 -c "
+from bs4 import BeautifulSoup
+import sys
+try:
+    soup = BeautifulSoup(open(sys.argv[1]).read(), 'html.parser')
+    c = soup.find(id='xwikicontent')
+    print(c.get_text(strip=True) if c else '')
+except: pass
+" "$html_file")
+    if echo "$content_text" | grep -q "Click on one or more tags to filter the list"; then
+        warn "skipping index page: ${note_dir#$PAGES_DIR/}"
+        COUNT_SKIP=$((COUNT_SKIP + 1))
+        continue
+    fi
+
+    # Build relative path from PAGES_DIR to note folder, decode each segment
+    rel_path="${note_dir#$PAGES_DIR/}"
+    decoded_path=$(python3 -c "
+import sys, urllib.parse
+parts = sys.argv[1].split('/')
+decoded = [urllib.parse.unquote(p.replace('+', ' ')) for p in parts]
+print('/'.join(decoded))
+" "$rel_path")
+
+    # Last segment is the note name, everything before is the folder hierarchy
+    note_name=$(basename "$decoded_path")
+    note_folder=$(dirname "$decoded_path")
+
+    out_category_dir="$OUTPUT_DIR/$note_folder"
     out_md="$out_category_dir/${note_name}.md"
-    out_assets_dir="$out_category_dir/${note_name}"
+    if [ "$FLAT_ATTACHMENTS" = true ]; then
+        out_assets_dir="$OUTPUT_DIR/_attachments"
+    else
+        out_assets_dir="$out_category_dir/${note_name}"
+    fi
 
     mkdir -p "$out_category_dir"
 
@@ -255,7 +325,7 @@ while IFS= read -r -d '' html_file; do
                 --strip-comments \
                 --no-highlight \
                 -o /dev/stdout 2>/dev/null \
-            | python3 -c "$IMG_FIXER" "$note_name" \
+            | python3 -c "$IMG_FIXER" "$note_name" "$FLAT_ATTACHMENTS" \
             > "$out_md"; then
         error "failed: $category/$note_name"
         COUNT_ERR=$((COUNT_ERR + 1))
@@ -263,21 +333,33 @@ while IFS= read -r -d '' html_file; do
     fi
 
     # --- Copy attachments ---
-    attach_src="$ATTACHMENTS_DIR/$category/$note_encoded/WebHome"
+    attach_src="$ATTACHMENTS_DIR/$rel_path/WebHome"
     if [ -d "$attach_src" ] && [ -n "$(ls -A "$attach_src" 2>/dev/null)" ]; then
         mkdir -p "$out_assets_dir"
-        cp -r "$attach_src/." "$out_assets_dir/"
-        log "$category/$note_name.md  (+attachments)"
+        ATTACH_COUNT=0
+        while IFS= read -r src_file; do
+            fname=$(basename "$src_file")
+            cp "$src_file" "$out_assets_dir/$fname"
+            if [ "$FLAT_ATTACHMENTS" = true ]; then
+                # Rewrite links: ![[Note name/fname]] → ![[_attachments/fname]]
+                escaped_note=$(printf '%s' "$note_name" | sed 's/[[\.*^$()+?{|]/\&/g')
+                sed -i "s|!\[\[${escaped_note}/${fname}\]\]|![[_attachments/${fname}]]|g" "$out_md"
+                sed -i "s|\[\[${escaped_note}/${fname}|\[\[_attachments/${fname}|g" "$out_md"
+            fi
+            ATTACH_COUNT=$((ATTACH_COUNT + 1))
+        done < <(find "$attach_src" -maxdepth 1 -type f)
+        log "$decoded_path.md  (+${ATTACH_COUNT} attachments)"
     else
-        log "$category/$note_name.md"
+        log "$decoded_path.md"
     fi
 
     COUNT_OK=$((COUNT_OK + 1))
 
-done < <(find "$PAGES_DIR" -mindepth 3 -maxdepth 3 -name "WebHome.html" -print0)
+done < <(find "$PAGES_DIR" -name "WebHome.html" -print0)
 
 echo "========================================================"
 echo " Done:   $COUNT_OK notes converted"
+[ $COUNT_SKIP -gt 0 ] && echo " Skipped: $COUNT_SKIP (index pages)"
 [ $COUNT_ERR -gt 0 ] && echo " Errors: $COUNT_ERR"
 echo " Output: $OUTPUT_DIR"
 echo "========================================================"
